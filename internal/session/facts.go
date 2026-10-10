@@ -74,6 +74,13 @@ const (
 	// FactsLegacyResetEvict is the eviction of a runtime a stalled
 	// continuation reset is waiting on.
 	FactsLegacyResetEvict FactsSite = "legacy.reset-evict"
+	// FactsOperatorAct is an operator's or agent's own act on a row as read
+	// just before it (Store.DecideFresh): a suspend, a kill, a resume, a
+	// heartbeat.
+	FactsOperatorAct FactsSite = "op.act"
+	// FactsResumeConsume is an operator's resume consuming the suspend it
+	// read before its start.
+	FactsResumeConsume FactsSite = "op.resume-consume"
 )
 
 // factsSite is how a site compares Facts: without Drop's keys, or only
@@ -123,6 +130,14 @@ var factsSites = map[FactsSite]factsSite{
 	FactsLegacyDrainStop: {
 		Only:   []string{"state", "state_reason", "generation", "instance_token"},
 		Reason: "the async stop and the escalation kill the incarnation that is still stop-pending; the mark already judged the operator's intent, and a resume cannot take a stop-pending row out (ErrSessionStopping)",
+	},
+	FactsOperatorAct: {
+		Only:   []string{"generation", "instance_token"},
+		Reason: "the act is on the incarnation it read; what it does to the row's holds the disposition table decides on the fresh read itself (ApplyDisposition), so no other fact gates it",
+	},
+	FactsResumeConsume: {
+		Only:   []string{"held_until", "sleep_intent", "quarantined_until", "wait_hold", "suspended_at", "generation", "instance_token"},
+		Reason: "the facts the resume read before its start: a write to any since (a newer suspend, kill, wait or quarantine, or another start) refuses the consume; state is left out, as legacy's heal moves it under a dormant row",
 	},
 	FactsLegacyResetEvict: {
 		Only:   []string{"continuation_reset_pending", "reset_committed_at"},
