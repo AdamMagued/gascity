@@ -52,7 +52,8 @@ func prepareAdoption(_ context.Context, r effectReads, v txView) (*preparedStart
 	if !ok || res.Err != nil {
 		return nil, errTemplateUnresolved
 	}
-	return prepareRow(r, v.World, v.Row, res.TP, transcriptOf(r, v.World, v.Row, res.TP))
+	repaired := foldInfo(v.Row, concretePoolWorkDirRepairPatch(startCandidate{info: v.Row, tp: res.TP}, v.World.CityPath, v.World.Env.Cfg)) // the dir prepare launches in
+	return prepareRow(r, v.World, v.Row, res.TP, transcriptOf(r, v.World, repaired, res.TP))
 }
 
 // transcriptOf is the state of row's session key's transcript in the work
@@ -60,8 +61,11 @@ func prepareAdoption(_ context.Context, r effectReads, v txView) (*preparedStart
 // or no probe.
 func transcriptOf(r effectReads, w *World, row session.Info, tp TemplateParams) sessTranscriptState {
 	sk := strings.TrimSpace(row.SessionKey)
+	if sk == "" {
+		return sessTranscriptUnknown
+	}
 	dir := launchWorkDir(r, w, row, tp)
-	if sk == "" || dir == "" {
+	if dir == "" {
 		return sessTranscriptUnknown
 	}
 	switch present, probeable := staleResumeKeyProbe(sessionTranscriptProvider(tp.ResolvedProvider, row), dir, sk); {

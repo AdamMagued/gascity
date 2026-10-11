@@ -516,21 +516,63 @@ func TestLaunchCommitPremise(t *testing.T) {
 	}
 }
 
-// Kills an endpoint-gate refusal or a provider capacity failure backed off
-// as a row failure: each is a deferral the breaker paces, as a swap pause
-// is (legacy keeps the row's place).
+// Kills an endpoint-gate refusal or a paced capacity failure backed off as
+// a row failure, and an unpaced one not backed off: the first two are
+// deferrals the breaker paces, as a swap pause is (legacy keeps the row's
+// place); a capacity refusal the poison valve blamed on its template, or
+// one with no ticket, is a start error, which backs off (legacy's failure
+// arms).
 func TestEndpointGateRefusalDoesNotBackOffRow(t *testing.T) {
-	for _, s := range []settlement{
-		{Outcome: settledRefused, Cause: causeEndpointGate},
-		{Outcome: settledFailed, Cause: causeCapacity},
+	for _, c := range []struct {
+		s       settlement
+		backoff bool
+	}{
+		{settlement{Outcome: settledRefused, Cause: causeEndpointGate}, false},
+		{settlement{Outcome: settledFailed, Cause: causeCapacity}, false},
+		{settlement{Outcome: settledFailed, Cause: causeStartError}, true},
 	} {
 		p := newPlanner(newFakePlannerClock(plannerT0), func() time.Duration { return time.Minute }, nil, newInflightMap(), nil, nil)
 		k := rowKey{Leg: rowLeg, ID: "a"}
-		s.Key, s.Kind, s.At = k, intentStart, plannerT0
-		p.backoffSettled(s)
-		if r, ok := p.backoff.Snapshot()[rowBackoffKey(k)]; ok {
-			t.Fatalf("row backoff %+v after %s, want none", r, s.Cause)
+		c.s.Key, c.s.Kind, c.s.At = k, intentStart, plannerT0
+		p.backoffSettled(c.s)
+		if _, ok := p.backoff.Snapshot()[rowBackoffKey(k)]; ok != c.backoff {
+			t.Fatalf("after %s: row backed off %v, want %v", c.s.Cause, ok, c.backoff)
 		}
+	}
+}
+
+// Kills a capacity refusal the poison valve blamed on its template settled
+// as the endpoint's (P9 of the C5a1-2 delta review): with another template
+// succeeding on the endpoint, the valve trips and records no breaker
+// failure, so the refusal settles start-error and backs the row off;
+// nothing else would pace it.
+func TestPoisonValveRefusalIsPacedByTheRow(t *testing.T) {
+	now := gatherNow
+	guard := newEndpointCapacityGuard(func() time.Time { return now })
+	k0 := endpointKey("provider:test-agent")
+	advance := func() { now = now.Add(guard.breaker(k0).Status().BackoffCap + time.Second) }
+	for i := 0; i < 3; i++ { // worker refused, other succeeds: the valve counts
+		tk, ok := guard.Admit(k0, "gc-1", "worker")
+		if !ok {
+			t.Fatalf("round %d: worker not admitted (%v)", i, guard.breaker(k0).Status().State)
+		}
+		tk.Resolve(verdictCapacity)
+		advance()
+		other, ok := guard.Admit(k0, "gc-9", "other")
+		if !ok {
+			t.Fatalf("round %d: other not admitted", i)
+		}
+		other.Resolve(verdictSuccess)
+	}
+	k, _ := launchKit(t, "asleep")
+	k.p.held.start.capacity, k.it.Endpoint = guard, k0
+	k.sp.nextStart = fmt.Errorf("quota: %w", runtime.ErrProviderCapacity)
+	s := k.runKind()
+	p := newPlanner(newFakePlannerClock(plannerT0), func() time.Duration { return time.Minute }, nil, newInflightMap(), nil, nil)
+	s.Key, s.Kind, s.At = k.it.Key, intentStart, plannerT0
+	p.backoffSettled(s)
+	if _, backedOff := p.backoff.Snapshot()[rowBackoffKey(k.it.Key)]; s.Cause != causeStartError || !backedOff || guard.breaker(k0).Status().State != resilience.StateClosed {
+		t.Fatalf("settlement %+v, row backed off %v, breaker %v; want start-error, backed off, the breaker untouched", s, backedOff, guard.breaker(k0).Status().State)
 	}
 }
 
@@ -749,7 +791,7 @@ func TestLaunchPersistsTheMCPSnapshotOnSuccessOnly(t *testing.T) {
 		blocked  bool // the snapshot path is a non-empty dir: a clear would fail
 	}{
 		{"a failed start", errors.New("boom"), causeStartError, false},
-		{"a capacity refusal", fmt.Errorf("quota: %w", runtime.ErrProviderCapacity), causeCapacity, true},
+		{"a capacity refusal with no ticket (legacy's failure arms)", fmt.Errorf("quota: %w", runtime.ErrProviderCapacity), causeStartError, true},
 	} {
 		k, _ := launchKit(t, "asleep")
 		row := k.p.World.Census.Rows[k.it.Key]
@@ -776,6 +818,22 @@ func TestLaunchPersistsTheMCPSnapshotOnSuccessOnly(t *testing.T) {
 	}
 }
 
+// Kills an unprobeable transcript read as absent (M26b): with no answer
+// from the transcript layer the key stays, unrotated.
+func TestUnprobeableTranscriptKeepsTheKey(t *testing.T) {
+	old := staleResumeKeyProbe
+	staleResumeKeyProbe = func(string, string, string) (bool, bool) { return false, false }
+	t.Cleanup(func() { staleResumeKeyProbe = old })
+	k, _ := launchKit(t, "asleep", "session_key", "k-1", "continuation_epoch", "5")
+	k.p.Clock.(*fakePlannerClock).auto = true
+	row := k.p.World.Census.Rows[k.it.Key]
+	tp := TemplateParams{TemplateName: "worker", Command: "agent", WorkDir: t.TempDir(), ResolvedProvider: &config.ResolvedProvider{Name: "claude", SessionIDFlag: "--session-id"}}
+	k.p.World.Templates = &templateMemo{entries: map[templateMemoKey]templateResolution{templateMemoKeyOf(row.Info): {TP: tp}}}
+	if s := k.runKind(); s.Outcome != settledLanded || k.meta("session_key") != "k-1" || k.meta("continuation_epoch") != "5" {
+		t.Fatalf("settlement %+v, key %q, epoch %q; want landed, the key kept, unrotated", s, k.meta("session_key"), k.meta("continuation_epoch"))
+	}
+}
+
 // Kills a stale resume key cleared without rotating the continuation
 // (legacy's commitPendingContinuationReset at the start, chat.go): the
 // PreWake bumps continuation_epoch and clears the pending mark in its own
@@ -793,6 +851,14 @@ func TestStaleKeyResetRotatesTheContinuation(t *testing.T) {
 	}
 	if env := leaf.cfgs[0].Env["GC_CONTINUATION_EPOCH"]; env != "6" || k.meta("continuation_epoch") != "6" || k.meta("continuation_reset_pending") != "" {
 		t.Fatalf("runtime epoch %q, row epoch %q, reset pending %q; want 6, 6 and cleared", env, k.meta("continuation_epoch"), k.meta("continuation_reset_pending"))
+	}
+	// A failed launch leaves the PreWake's write alone: rotated and cleared,
+	// with no commit to clear the mark for it.
+	failed, _ := launchKit(t, "asleep", "session_key", "stale", "continuation_epoch", "5", "started_config_hash", "h0")
+	failed.p.World.Templates = k.p.World.Templates
+	failed.sp.nextStart = errors.New("boom")
+	if s := failed.runKind(); s.Cause != causeStartError || failed.meta("continuation_epoch") != "6" || failed.meta("continuation_reset_pending") != "" {
+		t.Fatalf("a failed launch: settlement %+v, row epoch %q, reset pending %q; want start-error, 6 and cleared", s, failed.meta("continuation_epoch"), failed.meta("continuation_reset_pending"))
 	}
 }
 

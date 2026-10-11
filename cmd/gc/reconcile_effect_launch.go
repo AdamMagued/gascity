@@ -221,6 +221,7 @@ func boundTemplate(tp TemplateParams, row session.Info) TemplateParams {
 type startOutcome struct {
 	err      error
 	tp       TemplateParams // the template launched
+	paced    bool           // a capacity refusal the endpoint breaker paces: admitted on a ticket, the poison valve not tripped
 	prepared *preparedStart
 	mcp      session.MetadataPatch
 	health   string
@@ -248,6 +249,7 @@ func startLaunch(ctx context.Context, c txCaps, in launchPass) (startOutcome, er
 	switch {
 	case runtime.IsProviderCapacity(out.err):
 		in.ticket.verdict = verdictCapacity
+		out.paced = in.ticket.t != nil && !in.ticket.t.Resolve(verdictCapacity) // resolved now, for the valve's verdict
 	case out.err == nil && strings.TrimSpace(in.row.SessionKey) != "":
 		t := c.start.clock.NewTimer(staleKeyDetectDelay)
 		select {
@@ -282,8 +284,10 @@ func commitStep(v txView) txStep {
 	case cause == "": // whatever S2's states the row is in
 	case errors.Is(out.err, runtime.ErrSessionInitializing) || errors.Is(out.err, runtime.ErrRuntimeUnavailable):
 		return txStep{Fail: causeStartDeferred, Err: out.err}
-	case runtime.IsProviderCapacity(out.err):
+	case runtime.IsProviderCapacity(out.err) && out.paced:
 		return txStep{Fail: causeCapacity, Err: out.err}
+	case runtime.IsProviderCapacity(out.err): // no ticket, or the poison valve blamed this template: legacy's failure arms, which back off
+		return txStep{Fail: causeStartError, Err: out.err}
 	case died && (v.RT.Class == rtAbsent || v.RT.Class == rtCorpse || v.RT.Class == rtZombie):
 		return txStep{Fail: causeDiedDuringStartup, Err: out.err} // C5a2's abandon class
 	case errors.Is(out.err, runtime.ErrSessionExists) && (v.RT.Class == rtCorpse || v.RT.Class == rtZombie):
