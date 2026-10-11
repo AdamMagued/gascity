@@ -2286,6 +2286,10 @@ func TestExecutePlannedStartsTraced_AsyncReturnsBeforeProviderStartCompletes(t *
 
 func TestExecutePlannedStartsTraced_AsyncLimitsEnqueuedStartsPerTick(t *testing.T) {
 	testCity := t.TempDir()
+	// The released starts finish before the city dir is removed: cleanups
+	// run last-registered first, so this one runs after every release.
+	tracker := &asyncStartTracker{}
+	t.Cleanup(func() { tracker.wait(10 * time.Second) })
 	store := beads.NewMemStore()
 	clk := &clock.Fake{Time: time.Date(2026, 4, 26, 12, 1, 0, 0, time.UTC)}
 	sp := newGatedStartProvider()
@@ -2334,6 +2338,7 @@ func TestExecutePlannedStartsTraced_AsyncLimitsEnqueuedStartsPerTick(t *testing.
 		ioDiscard{},
 		nil,
 		withAsyncStartExecution(),
+		withAsyncStartTracker(tracker),
 	)
 	wantWoken := maxWakes
 	if woken != wantWoken {
